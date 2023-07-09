@@ -59,6 +59,9 @@ context 会在函数传递间传递。只需要在适当的时间调用 cancel �
 3. 不要把本应该作为函数参数的类型塞到 context 中，context 存储的应该是一些共同的数据。例如：登陆的 session、cookie 等。
 4. 同一个 context 可能会被传递到多个 goroutine，别担心，context 是并发安全的。
 
+下面介绍的是 context 的具体使用方法，包括使用 context 传递共享的数据，取消 goroutine ，或者避免goroutine泄漏。
+
+
 # 传递共享的数据
 
 对于 Web 服务端开发，往往希望将一个请求处理的整个过程串起来，这就非常依赖于 Thread Local（对于 Go 可理解为单个协程所独有） 的变量，而在 Go 语言中并没有这个概念，因此需要在函数调用的时候传递 context。
@@ -220,7 +223,7 @@ func main() {
 }
 ```
 
-当 n == 5 的时候，直接 break 掉。那么 gen 函数的协程就会执行无限循环，永远不会停下来。发生了 goroutine 泄漏。
+当 n == 5 的时候，直接 break 掉。那么 gen 函数的协程就会执行无限循环(ray注：这里并不会无限循环，因为没有了接受者，往管道里放数据会阻塞住)，永远不会停下来。发生了 goroutine 泄漏。
 
 用 context 改进这个例子：
 

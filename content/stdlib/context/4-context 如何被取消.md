@@ -72,7 +72,7 @@ type Context interface {
 
 ```golang
 type canceler interface {
-	cancel(removeFromParent bool, err error)
+	cancel(removeFromParent bool, err, cause error)
 	Done() <-chan struct{}
 }
 ```
@@ -151,9 +151,10 @@ type cancelCtx struct {
 
 	// 保护之后的字段
 	mu       sync.Mutex
-	done     chan struct{}
+	done     atomic.Value
 	children map[canceler]struct{}
-	err      error
+	err      error // set to non-nil by the first cancel call
+	cause    error // set to non-nil by the first cancel call
 }
 ```
 
@@ -173,6 +174,26 @@ func (c *cancelCtx) Done() <-chan struct{} {
 }
 ```
 
+在1.20新版本标准库中的实现：
+
+```golang
+func (c *cancelCtx) Done() <-chan struct{} {
+	d := c.done.Load()
+	if d != nil{
+		return d.(chan struct{})
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d = c.done.Load()
+	if d == nil {
+		d = make(chan struct{})
+		c.done.Store(d)
+	}
+	return d.(chan struct{})
+}
+```
+
+
 c.done 是“懒汉式”创建，只有调用了 Done() 方法的时候才会被创建。再次说明，函数返回的是一个只读的 channel，而且没有地方向这个 channel 里面写数据。所以，直接调用读这个 channel，协程会被 block 住。一般通过搭配 select 来使用。一旦关闭，就会立即读出零值。
 
 `Err()` 和 `String()` 方法比较简单，不多说。推荐看源码，非常简单。
@@ -180,10 +201,13 @@ c.done 是“懒汉式”创建，只有调用了 Done() 方法的时候才会�
 接下来，我们重点关注 `cancel()` 方法的实现：
 
 ```golang
-func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+func (c *cancelCtx) cancel(removeFromParent bool, err, cause error) {
     // 必须要传 err
 	if err == nil {
 		panic("context: internal error: missing cancel error")
+	}
+	if cause == nil {
+		cause = err
 	}
 	c.mu.Lock()
 	if c.err != nil {
@@ -192,17 +216,19 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 	}
 	// 给 err 字段赋值
 	c.err = err
-	// 关闭 channel，通知其他协程
-	if c.done == nil {
-		c.done = closedchan
+	c.cause = cause
+	// 关闭channel，通知其他协程
+	d, _ := c.done.Load().(chan struct{})
+	if d == nil {
+		c.done.Store(closedchan)
 	} else {
-		close(c.done)
+		close(d)
 	}
 	
 	// 遍历它的所有子节点
 	for child := range c.children {
 	    // 递归地取消所有子节点
-		child.cancel(false, err)
+		child.cancel(false, err, cause)
 	}
 	// 将子节点置空
 	c.children = nil
@@ -215,7 +241,7 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 }
 ```
 
-总体来看，`cancel()` 方法的功能就是关闭 channel：c.done；递归地取消它的所有子节点；从父节点从删除自己。达到的效果是通过关闭 channel，将取消信号传递给了它的所有子节点。goroutine 接收到取消信号的方式就是 select 语句中的`读 c.done` 被选中。
+总体来看，`cancel()` 方法的功能就是关闭 channel：c.done；递归地取消它的所有子节点；从父节点中删除自己。达到的效果是通过关闭 channel，将取消信号传递给了它的所有子节点。goroutine 接收到取消信号的方式就是 select 语句中的`读 c.done` 被选中。
 
 我们再来看创建一个可取消的 Context 的方法：
 
@@ -275,6 +301,8 @@ delete(p.children, child)
 
 如上左图，代表一棵 context 树。当调用左图中标红 context 的 cancel 方法后，该 context 从它的父 context 中去除掉了：实线箭头变成了虚线。且虚线圈框出来的 context 都被取消了，圈内的 context 间的父子关系都荡然无存了。
 
+> 这里想到了一个问题，如果cancelCtx的子context是withValue生成的valueCtx呢？
+
 重点看 `propagateCancel()`：
 
 ```golang
@@ -317,7 +345,7 @@ func propagateCancel(parent Context, child canceler) {
 
 这里就有疑问了，既然没找到可以取消的父节点，那 `case <-parent.Done()` 这个 case 就永远不会发生，所以可以忽略这个 case；而 `case <-child.Done()` 这个 case 又啥事不干。那这个 `else` 不就多余了吗？
 
-其实不然。我们来看 `parentCancelCtx` 的代码：
+其实不然。我们来看 `parentCancelCtx` 的代码，以递归的形式获取父节点中的cancelCtx：
 
 ```golang
 func parentCancelCtx(parent Context) (*cancelCtx, bool) {
@@ -331,6 +359,61 @@ func parentCancelCtx(parent Context) (*cancelCtx, bool) {
 			parent = c.Context
 		default:
 			return nil, false
+		}
+	}
+}
+```
+
+
+在1.20版本的标准库中，`parentCancelCtx`的写法略有差异，如下所示：
+
+```golang
+func parentCancelCtx(parent Context) (*cancelCtx, bool) {
+	// 假设parent的类型为valueCtx，且其父节点无cancelCtx，则done==nil
+	// 假设parent类型为cancelCtx或者timerCtx或valueCtx(父节点包含cancelCtx)，但是done为closedchan，表示其作为子节点已经被取消掉了，并不是直接被取消掉的
+	done := parent.Done()
+	if done == closedchan || done == nil {
+		return nil, false
+	}
+	// 这里会根据parent的context类型调用相应的Value方法，这里最后都调用了value(c Context, key any) any方法
+	p, ok := parent.Value(&cancelCtxKey).(*cancelCtx)
+	if !ok {
+		return nil, false
+	}
+	// 这里会再次校验done方法是否一致，如果不一致返回false
+	pdone, _ := p.done.Load().(chan struct{})
+	if pdone != done {
+		return nil, false
+	}
+	return p, true
+}
+```
+
+`value`方法如下所示：与低版本的go写法类似，不过套了一层`parent.Value`方法
+
+```golang
+func value(c Context, key any) any {
+	for {
+		switch ctx := c.(type) {
+		case *valueCtx:
+			if key == ctx.key {
+				return ctx.val
+			}
+			c = ctx.Context
+		case *cancelCtx:
+			if key == &cancelCtxKey {
+				return c
+			}
+			c = ctx.Context
+		case *timerCtx:
+			if key == &cancelCtxKey {
+				return ctx.cancelCtx
+			}
+			c = ctx.Context
+		case *emptyCtx:
+			return nil
+		default:
+			return c.Value(key)
 		}
 	}
 }
@@ -369,7 +452,9 @@ func main() {
 }
 ```
 
-我自已在 else 里添加的打印语句我就不贴出来了，感兴趣的可以自己动手实验下。我们看下三个 context 的打印结果：
+> 这里需要理解执行`childFun`和`parentFunc`打印输出的结果有什么区别。这里在1.20标准库的版本中，直接嵌套的形式仍然能够正确地通过`parentCancelCtx`获取到父节点中的cancelCtx类型的context。除非重写该方法的`Value`方法，不调用默认的嵌套的cancelCtx类型的`Value`方法。比如说这里的Value在获取key为`cancelCtxKey`时随便返回一个int值，此时`parentCancelCtx`就无法获取到正确的parentCancelCtx了。也就是说父cancelCtx中的children数组中没存当前context，父cancelCtx在取消时就没法通知到该context，所以需要起一个goroutine进行监听。
+
+我已在 else 里添加的打印语句我就不贴出来了，感兴趣的可以自己动手实验下。我们看下三个 context 的打印结果：
 
 ```shell
 context.Background.WithCancel
